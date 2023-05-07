@@ -146,7 +146,7 @@ def train(args):
     text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
     # モデルに xformers とか memory efficient attention を組み込む
-    train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers)
+    train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdp)
 
     # 学習を準備する
     if cache_latents:
@@ -277,7 +277,7 @@ def train(args):
     else:
         unet.eval()
         text_encoder.eval()
-        
+
     network.prepare_grad_etc(text_encoder, unet)
 
     if not cache_latents:
@@ -713,7 +713,7 @@ def train(args):
     if is_main_process:
         ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
         save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
-        
+
         print("model saved.")
 
 

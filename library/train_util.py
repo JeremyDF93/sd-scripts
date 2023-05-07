@@ -1764,11 +1764,13 @@ class FlashAttentionFunction(torch.autograd.function.Function):
         return dq, dk, dv, None, None, None, None
 
 
-def replace_unet_modules(unet: diffusers.models.unet_2d_condition.UNet2DConditionModel, mem_eff_attn, xformers):
+def replace_unet_modules(unet: diffusers.models.unet_2d_condition.UNet2DConditionModel, mem_eff_attn, xformers, sdp):
     if mem_eff_attn:
         replace_unet_cross_attn_to_memory_efficient()
     elif xformers:
         replace_unet_cross_attn_to_xformers()
+    elif sdp:
+        replace_unet_cross_attn_to_sdp()
 
 
 def replace_unet_cross_attn_to_memory_efficient():
@@ -1852,6 +1854,55 @@ def replace_unet_cross_attn_to_xformers():
         return out
 
     diffusers.models.attention.CrossAttention.forward = forward_xformers
+
+def replace_unet_cross_attn_to_sdp():
+    print("Replace CrossAttention.forward to use scaled dot product (PyTorch)")
+
+    def scaled_dot_product_attention_forward(self, x, context=None, mask=None):
+        batch_size, sequence_length, inner_dim = x.shape
+
+        if mask is not None:
+            mask = self.prepare_attention_mask(mask, sequence_length, batch_size)
+            mask = mask.view(batch_size, self.heads, -1, mask.shape[-1])
+
+        h = self.heads
+        q_in = self.to_q(x)
+
+        context = default(context, x)
+        context = context.to(x.dtype)
+
+        if hasattr(self, "hypernetwork") and self.hypernetwork is not None:
+            context_k, context_v = self.hypernetwork.forward(x, context)
+            context_k = context_k.to(x.dtype)
+            context_v = context_v.to(x.dtype)
+        else:
+            context_k = context
+            context_v = context
+
+        k_in = self.to_k(context_k)
+        v_in = self.to_v(context_v)
+
+        head_dim = inner_dim // h
+        q = q_in.view(batch_size, -1, h, head_dim).transpose(1, 2)
+        k = k_in.view(batch_size, -1, h, head_dim).transpose(1, 2)
+        v = v_in.view(batch_size, -1, h, head_dim).transpose(1, 2)
+
+        del q_in, k_in, v_in
+
+        # the output of sdp = (batch, num_heads, seq_len, head_dim)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
+        )
+
+        out = out.transpose(1, 2).reshape(batch_size, -1, h * head_dim)
+
+        # linear proj
+        out = self.to_out[0](out)
+        # dropout
+        out = self.to_out[1](out)
+        return out
+
+    diffusers.models.attention.CrossAttention.forward = scaled_dot_product_attention_forward
 
 
 # endregion
@@ -2047,6 +2098,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="use memory efficient attention for CrossAttention / CrossAttentionに省メモリ版attentionを使う",
     )
     parser.add_argument("--xformers", action="store_true", help="use xformers for CrossAttention / CrossAttentionにxformersを使う")
+    parser.add_argument("--sdp", action="store_true", help="use scaled dot product for CrossAttention")
     parser.add_argument(
         "--vae", type=str, default=None, help="path to checkpoint of vae to replace / VAEを入れ替える場合、VAEのcheckpointファイルまたはディレクトリ"
     )
